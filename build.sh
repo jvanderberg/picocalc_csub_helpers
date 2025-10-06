@@ -16,9 +16,26 @@ OBJ="${BASENAME}.elf"
 BIN="${BASENAME}.bin"
 HEX="${BASENAME}.hex"
 
+CPU_TARGET=${CPU_TARGET:-rp2350}
+
+cpu_lower=$(printf '%s' "${CPU_TARGET}" | tr 'A-Z' 'a-z')
+
+case "${cpu_lower}" in
+  rp2040)
+    MCU_FLAG=-mcpu=cortex-m0plus
+    ;;
+  rp2350)
+    MCU_FLAG=-mcpu=cortex-m33
+    ;;
+  *)
+    echo "error: unknown CPU_TARGET '${CPU_TARGET}' (use rp2040 or rp2350)" >&2
+    exit 1
+    ;;
+esac
+
 ARM_CFLAGS=(
   -Os
-  -mcpu=cortex-m33
+  "${MCU_FLAG}"
   -mthumb
   -fno-function-sections
   -fno-data-sections
