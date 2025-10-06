@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export CPU_TARGET=rp2350
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "${SCRIPT_DIR}"
 

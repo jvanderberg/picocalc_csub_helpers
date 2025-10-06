@@ -14,7 +14,6 @@ SRC=${1:-pow_int_cf.c}
 BASENAME=$(basename "${SRC}" .c)
 OBJ="${BASENAME}.elf"
 BIN="${BASENAME}.bin"
-HEX="${BASENAME}.hex"
 
 CPU_TARGET=${CPU_TARGET:-rp2350}
 
@@ -46,13 +45,11 @@ ARM_CFLAGS=(
 
 arm-none-eabi-gcc "${ARM_CFLAGS[@]}" -c "${SRC}" -o "${OBJ}"
 arm-none-eabi-objcopy -O binary "${OBJ}" "${BIN}"
-xxd -ps -c16 "${BIN}" > "${HEX}"
 
 cat <<MSG
 Built CFunction payloads:
   ELF    : ${OBJ}
   Binary : ${BIN}
-  Hex    : ${HEX} (16-byte chunks, handy for pasting into AMRCFGEN)
 
 To generate the BASIC CSUB block, run (adjust the signature to match the routine), e.g.:
   ./emit_cfunction_block.sh ${BIN} "pow_int integer, integer, integer"
