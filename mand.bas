@@ -37,17 +37,13 @@ Const X_MIN_DEF = -2.0
 Const X_MAX_DEF = 1.0
 Const Y_MIN_DEF = -1.5
 Const Y_MAX_DEF = 1.5
-Const MAX_ITER = 256
+Const MAX_ITER = 512
 Const STACK_MAX = 16
 Const MENU_BG = RGB(40, 40, 40)
 Const MENU_FG = RGB(255, 255, 255)
 Const CURSOR_CLR = RGB(255, 255, 0)
 Const OVERLAY_MAX = MANDEL_W * 4
 
-Const PALETTE_CURVE$ = "cosine"   ' "cosine" or "gamma"
-Const PALETTE_GAMMA  = 0.75       ' <1 expands high iters; try 0.7..0.9
-Const CYCLE_COLORS = 64         ' size of the repeating palette
-Const PALETTE_PHASE = 0         ' 0..63, optional hue rotation
 
 Dim iterColor%(MAX_ITER)   ' iteration->RGB color lookup
 Dim dyFix%                 ' Q28 step per row
@@ -90,7 +86,7 @@ Dim pendingKey%        ' -1 means none pending
 Dim fbReady%           ' framebuffer created flag
 Dim PALETTE_NAME$
 
-PALETTE_NAME$ = "turbo"   ' "viridis", "inferno", or "turbo"
+PALETTE_NAME$ = "rainbow"   ' default palette
 
 pendingKey% = -1
 fbReady% = 0
@@ -116,31 +112,83 @@ Sub BlitLine(y As Integer)
   ' args: from, to, xin, yin, xout, yout, w, h
   BLIT FRAMEBUFFER F, N, 0, y, 0, MANDEL_TOP + y, MANDEL_W, 1
 End Sub
-' ----------------------------------------------------------------------
-Function IterToT(i As Integer) As Float
-  Local u As Float, t As Float
-  If MAX_ITER <= 1 Then
-    IterToT = 0
-    Exit Function
-  EndIf
-
-  ' Normalize 1..MAX_ITER-1 -> 0..1
-  u = (i - 1) / (MAX_ITER - 1.0)
-
-  ' Clamp using multi-line If/ElseIf
-  If u < 0 Then
-    u = 0
-  ElseIf u > 1 Then
-    u = 1
-  EndIf
-
-  If LCase$(PALETTE_CURVE$) = "cosine" Then
-    t = (1 - Cos(u * 3.14159265)) / 2
-    IterToT = t ^ PALETTE_GAMMA
-  Else
-    IterToT = u ^ PALETTE_GAMMA
-  EndIf
+Function Frac2(a As Float) As Float
+  Frac2 = a - 2 * Int(a / 2)
 End Function
+
+Function HslRGB(h As Float, sPct As Float, lPct As Float) As Integer
+  Local s As Float, l As Float, c As Float, hp As Float, x As Float, m As Float
+  Local r1 As Float, g1 As Float, b1 As Float
+  Local R% As Integer, G% As Integer, B% As Integer
+  Local hi% As Integer
+
+  ' --- normalize inputs ---
+  If h < 0 Then
+    h = 0
+  ElseIf h >= 360 Then
+    h = h - 360 * Int(h \ 360)
+  EndIf
+
+  If sPct < 0 Then
+    sPct = 0
+  ElseIf sPct > 100 Then
+    sPct = 100
+  EndIf
+
+  If lPct < 0 Then
+    lPct = 0
+  ElseIf lPct > 100 Then
+    lPct = 100
+  EndIf
+
+  s = sPct / 100.0
+  l = lPct / 100.0
+  c = (1 - Abs(2 * l - 1)) * s
+  hp = h / 60.0
+  x = c * (1 - Abs(Frac2(hp) - 1))
+  m = l - c / 2
+
+  ' --- hue sector 0..5 ---
+  hi% = Int(hp)
+  If hi% = 0 Then
+    r1 = c : g1 = x : b1 = 0
+  ElseIf hi% = 1 Then
+    r1 = x : g1 = c : b1 = 0
+  ElseIf hi% = 2 Then
+    r1 = 0 : g1 = c : b1 = x
+  ElseIf hi% = 3 Then
+    r1 = 0 : g1 = x : b1 = c
+  ElseIf hi% = 4 Then
+    r1 = x : g1 = 0 : b1 = c
+  Else
+    r1 = c : g1 = 0 : b1 = x
+  EndIf
+
+  ' --- add m, scale, clamp to 0..255 ---
+  R% = Int((r1 + m) * 255 + 0.5)
+  If R% < 0 Then
+    R% = 0
+  ElseIf R% > 255 Then
+    R% = 255
+  EndIf
+
+  G% = Int((g1 + m) * 255 + 0.5)
+  If G% < 0 Then
+    G% = 0
+  ElseIf G% > 255 Then
+    G% = 255
+  EndIf
+
+  B% = Int((b1 + m) * 255 + 0.5)
+  If B% < 0 Then
+    B% = 0
+  ElseIf B% > 255 Then
+    B% = 255
+  EndIf
+
+  HslRGB = RGB(R%, G%, B%)
+End Function
+
 
 ' Non-blocking key read: returns -1 if no key waiting
 Function ConsumeKeyIfAny() As Integer
@@ -215,7 +263,7 @@ Sub DrawMenu()
     ' BOX uses width/height (W,H), not x2/y2
     Box 0, 0, SCREEN_W, MENU_H, 1, MENU_BG, MENU_BG
     ' TEXT needs a string; leave optional args blank, set colours
-    Text 6, 2, "Z=Zoom  O=Back  R=Reset  Esc=Quit", , , , MENU_FG, MENU_BG
+    Text 6, 2, "Z)oom  O)ut  R)eset  P)alette  Esc", , , , MENU_FG, MENU_BG
 End Sub
 
 Sub DrawZoomBox(boxX As Integer, boxY As Integer, boxSize As Integer)
@@ -420,89 +468,48 @@ End Sub
 
 
 
-Sub BuildPaletteFromStops(name$)
-  ' fixed-size stop arrays (8 stops)
-  Local sT(7) As Float
-  Local sR%(7), sG%(7), sB%(7)
-  Local i%, j% 
-  Local t As Float, segT As Float
-  Local r As Float, g As Float, b As Float
-  Local tt As Float
-  ' ---- define color stops ----
-  Select Case LCase$(name$)
-    Case "viridis"
-      sT(0)=0.00: sR%(0)= 68: sG%(0)=  1: sB%(0)= 84
-      sT(1)=0.15: sR%(1)= 71: sG%(1)= 44: sB%(1)=122
-      sT(2)=0.30: sR%(2)= 59: sG%(2)= 81: sB%(2)=138
-      sT(3)=0.45: sR%(3)= 44: sG%(3)=113: sB%(3)=142
-      sT(4)=0.60: sR%(4)= 33: sG%(4)=144: sB%(4)=141
-      sT(5)=0.75: sR%(5)= 73: sG%(5)=176: sB%(5)=110
-      sT(6)=0.90: sR%(6)=159: sG%(6)=190: sB%(6)= 87
-      sT(7)=1.00: sR%(7)=253: sG%(7)=231: sB%(7)= 37
-    Case "inferno"
-      sT(0)=0.00: sR%(0)=  0: sG%(0)=  0: sB%(0)=  4
-      sT(1)=0.15: sR%(1)= 31: sG%(1)= 12: sB%(1)= 72
-      sT(2)=0.30: sR%(2)= 85: sG%(2)= 15: sB%(2)=109
-      sT(3)=0.45: sR%(3)=136: sG%(3)= 34: sB%(3)=106
-      sT(4)=0.60: sR%(4)=191: sG%(4)= 72: sB%(4)= 83
-      sT(5)=0.75: sR%(5)=234: sG%(5)=132: sB%(5)= 52
-      sT(6)=0.90: sR%(6)=252: sG%(6)=194: sB%(6)= 68
-      sT(7)=1.00: sR%(7)=252: sG%(7)=255: sB%(7)=164
-    Case Else ' "turbo"
-      sT(0)=0.00: sR%(0)= 48: sG%(0)= 18: sB%(0)= 59
-      sT(1)=0.15: sR%(1)=  0: sG%(1)= 67: sB%(1)=166
-      sT(2)=0.30: sR%(2)=  3: sG%(2)=141: sB%(2)=195
-      sT(3)=0.45: sR%(3)= 46: sG%(3)=194: sB%(3)=126
-      sT(4)=0.60: sR%(4)=193: sG%(4)=221: sB%(4)= 61
-      sT(5)=0.75: sR%(5)=255: sG%(5)=170: sB%(5)=  0
-      sT(6)=0.90: sR%(6)=231: sG%(6)= 77: sB%(6)=  0
-      sT(7)=1.00: sR%(7)=125: sG%(7)=  0: sB%(7)=  0
-  End Select
+' ------- JS-style palettes (rainbow, blue, blue2) -------
+Sub BuildPalette(name$)
+  Local i%                   ' iteration index
+  Local hue As Float
+  Local sat As Float
+  Local lit As Float
+  Local nm$ : nm$ = LCase$(name$)
 
- ' ---- full-range iter->colour using non-linear spread ----
-  Local cycle%(CYCLE_COLORS - 1)
-  Local k%
-  Local idx%, src%
-
-  ' Build a 64-swatch cycle from the same palette stops
-  For k% = 0 To CYCLE_COLORS - 1
-    ' sample evenly across 0..1 (centered in each bin to avoid duplicate endpoints)
-    tt = (k% + 0.5) / CYCLE_COLORS
-    ' find segment for tt
-    For j% = 0 To 6
-      If tt <= sT(j%+1) Then Exit For
-    Next j%
-    If sT(j%+1) > sT(j%) Then
-      segT = (tt - sT(j%)) / (sT(j%+1) - sT(j%))
-    Else
-      segT = 0
-    EndIf
-    r = sR%(j%) + (sR%(j%+1) - sR%(j%)) * segT
-    g = sG%(j%) + (sG%(j%+1) - sG%(j%)) * segT
-    b = sB%(j%) + (sB%(j%+1) - sB%(j%)) * segT
-    cycle%(k%) = RGB(Int(r), Int(g), Int(b))
-  Next k%
-
-  ' Map iterations cyclically:
-  ' 1..64  -> cycle 0..63
-  ' 65..128-> cycle 0..63, etc.
+  ' Fill iter colors for all escape bins 0..MAX_ITER-1
   For i% = 0 To MAX_ITER - 1
-    If i% <= 0 Then
-      idx% = 0
-    Else
-      idx% = (i% - 1) Mod CYCLE_COLORS
+    If nm$ = "rainbow" Then
+      ' h = (360 * 2 * i / MAX_ITER) % 360, s=90, l=50
+      hue = (720.0 * i% / MAX_ITER)
+      hue = hue - 360.0 * Int(hue \ 360.0)
+      sat = 90 : lit = 50
+      iterColor%(i%) = HslRGB(hue, sat, lit)
+
+    ElseIf nm$ = "blue" Then
+      ' h = (((120 * 2 * i) / MAX_ITER) % 120) + 180, s=90, l=50
+      hue = (240.0 * i% / MAX_ITER)
+      hue = hue - 120.0 * Int(hue \ 120.0)
+      hue = hue + 180.0   ' 180..300 range
+      sat = 90 : lit = 50
+      iterColor%(i%) = HslRGB(hue, sat, lit)
+
+    Else ' "blue2"
+      ' h = 220, s=90, l = ((75 * 2 * i) / MAX_ITER) % 75
+      hue = 220
+      sat = 90
+      lit = (150.0 * i% / MAX_ITER)
+      lit = lit - 75.0 * Int(lit \ 75.0)   ' 0..75 repeating
+      iterColor%(i%) = HslRGB(hue, sat, lit)
     EndIf
-    iterColor%(i%) = cycle%(idx%)
   Next i%
 
-  ' Distinct interior (did not escape by MAX_ITER)
-  iterColor%(MAX_ITER) = RGB(0,0,0)
-
+  ' Interior colour (did not escape by MAX_ITER)
+  iterColor%(MAX_ITER) = RGB(0, 0, 0)
 End Sub
 
 
 CLS
-BuildPaletteFromStops PALETTE_NAME$
+BuildPalette PALETTE_NAME$
 ResetViewport
 DrawMenu
 RenderViewport
@@ -520,6 +527,7 @@ Do While running = 1
     Select Case keyCode
         Case 90, 122, 128, 129, 130, 131         ' Z/z, and arrows
             DoZoom
+        Case 66, 98           ' B/b
         Case 79, 111          ' O/o (zoom out/back)
             If PopViewport() Then
                 CLS
@@ -535,15 +543,15 @@ Do While running = 1
             running = 0
         Case 80, 112          ' P/p Palette cycle (debug)
             ' cycle through palettes for testing
-            If LCase$(PALETTE_NAME$) = "turbo" Then
-                BuildPaletteFromStops "viridis"
-                PALETTE_NAME$ = "viridis"
-            ElseIf LCase$(PALETTE_NAME$) = "viridis" Then
-                BuildPaletteFromStops "inferno"
-                PALETTE_NAME$ = "inferno"
+            If LCase$(PALETTE_NAME$) = "blue" Then
+                BuildPalette "blue2"
+                PALETTE_NAME$ = "blue2"
+            ElseIf LCase$(PALETTE_NAME$) = "blue2" Then
+                BuildPalette "rainbow"
+                PALETTE_NAME$ = "rainbow"
             Else
-                BuildPaletteFromStops "turbo"
-                PALETTE_NAME$ = "turbo"
+                BuildPalette "blue"
+                PALETTE_NAME$ = "blue"
             EndIf
             CLS
             DrawMenu
