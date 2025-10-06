@@ -40,7 +40,7 @@ cfunc/
 
 ```sh
 cd cfunc
-./build_pow                # builds pow_int_cf.c and updates test_pow.bas
+./build_pow.sh                # builds pow_int_cf.c and updates test_pow.bas
 ```
 
 `test_pow.bas` now contains the CSUB block plus the boilerplate BASIC code that calls it:
@@ -56,7 +56,7 @@ Swap in your own BASIC code, or copy the CSUB block to another program.
 
 ```sh
 cd cfunc
-./build_mand              # rebuilds mandelbrot_cf.c and patches mand.bas & test_mandel.bas
+./build_mand.sh              # rebuilds mandelbrot_cf.c and patches mand.bas & test_mandel.bas
 ```
 
 `mand.bas` now contains:
