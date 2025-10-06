@@ -96,3 +96,11 @@ export CPU_TARGET=rp2040
 With that pattern you can swap out any slow loop—fixed-point math, pixel plots, FFT, you name it—without
 touching the firmware. The build helpers take care of the heavy lifting: Cross-compile, emit the hex block, and
 patch your BASIC source so it’s always in sync with the latest native code.
+
+## Other Documentation
+
+This may not be entirely up to date
+
+[CFunctions Overview](https://www.thebackshed.com/forum/uploads/G8JCF/2015-04-30_094418_CFunctionOverview.pdf)
+
+[Summary of Forum posts and guides](https://fruitoftheshed.com/wiki/doku.php?id=mmbasic:csubs_and_cfunctions_-_creation)
