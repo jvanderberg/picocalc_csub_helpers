@@ -1,4 +1,4 @@
-' Mandelbrot renderer with menu (PicoMite MMBasic) — interruptible render
+' Mandelbrot renderer with menu (PicoMite MMBasic) — interruptible render + per-line blit
 OPTION EXPLICIT
 OPTION CONTINUATION LINES ON
 
@@ -28,21 +28,31 @@ Const SCALE = 268435456            ' 1 << 28 fixed point
 Const SCREEN_W = 320
 Const SCREEN_H = 320
 Const MENU_H = 16
+Const BLINDS = 16                   ' number of interleaved regions for rendering
 Const MANDEL_W = SCREEN_W
 Const MANDEL_H = SCREEN_H - MENU_H
 Const MANDEL_TOP = MENU_H
-Const BLOCK_W = 64
+Const BLOCK_W = 320
 Const X_MIN_DEF = -2.0
 Const X_MAX_DEF = 1.0
 Const Y_MIN_DEF = -1.5
 Const Y_MAX_DEF = 1.5
-Const MAX_ITER = 64
+Const MAX_ITER = 256
 Const STACK_MAX = 16
 Const MENU_BG = RGB(40, 40, 40)
 Const MENU_FG = RGB(255, 255, 255)
 Const CURSOR_CLR = RGB(255, 255, 0)
 Const OVERLAY_MAX = MANDEL_W * 4
 
+Const PALETTE_CURVE$ = "cosine"   ' "cosine" or "gamma"
+Const PALETTE_GAMMA  = 0.75       ' <1 expands high iters; try 0.7..0.9
+Const CYCLE_COLORS = 64         ' size of the repeating palette
+Const PALETTE_PHASE = 0         ' 0..63, optional hue rotation
+
+Dim iterColor%(MAX_ITER)   ' iteration->RGB color lookup
+Dim dyFix%                 ' Q28 step per row
+Dim xMinFix%, yMinFix%     ' Q28 viewport minima in fixed-point
+Dim linebuf%(MANDEL_W - 1)
 Dim colors%(255)
 Dim block%(BLOCK_W - 1)
 Dim startX%
@@ -77,8 +87,60 @@ Dim overlayY%(OVERLAY_MAX - 1)
 Dim overlayClr%(OVERLAY_MAX - 1)
 Dim overlayCnt As Integer
 Dim pendingKey%        ' -1 means none pending
+Dim fbReady%           ' framebuffer created flag
+Dim PALETTE_NAME$
+
+PALETTE_NAME$ = "turbo"   ' "viridis", "inferno", or "turbo"
 
 pendingKey% = -1
+fbReady% = 0
+
+' ---------- Framebuffer helpers (fixed to use codes "F"/"N") ----------
+Sub EnsureFramebuffer()
+  If fbReady% = 0 Then
+    FRAMEBUFFER CREATE           ' creates framebuffer "F" (and matches current mode)
+    fbReady% = 1
+  EndIf
+End Sub
+
+Sub FBWriteOn()
+  FRAMEBUFFER WRITE "F"          ' draw into framebuffer
+End Sub
+
+Sub FBWriteOff()
+  FRAMEBUFFER WRITE "N"          ' draw to the physical display
+End Sub
+
+Sub BlitLine(y As Integer)
+  ' Copy one scanline from framebuffer F -> display N
+  ' args: from, to, xin, yin, xout, yout, w, h
+  BLIT FRAMEBUFFER F, N, 0, y, 0, MANDEL_TOP + y, MANDEL_W, 1
+End Sub
+' ----------------------------------------------------------------------
+Function IterToT(i As Integer) As Float
+  Local u As Float, t As Float
+  If MAX_ITER <= 1 Then
+    IterToT = 0
+    Exit Function
+  EndIf
+
+  ' Normalize 1..MAX_ITER-1 -> 0..1
+  u = (i - 1) / (MAX_ITER - 1.0)
+
+  ' Clamp using multi-line If/ElseIf
+  If u < 0 Then
+    u = 0
+  ElseIf u > 1 Then
+    u = 1
+  EndIf
+
+  If LCase$(PALETTE_CURVE$) = "cosine" Then
+    t = (1 - Cos(u * 3.14159265)) / 2
+    IterToT = t ^ PALETTE_GAMMA
+  Else
+    IterToT = u ^ PALETTE_GAMMA
+  EndIf
+End Function
 
 ' Non-blocking key read: returns -1 if no key waiting
 Function ConsumeKeyIfAny() As Integer
@@ -199,12 +261,21 @@ Sub UndrawZoomBox()
     overlayCnt = 0
 End Sub
 
-' Interruptible renderer: checks for key every ~10 lines.
+' Window-blind render: interleave rows across BLINDS regions
 Sub RenderViewport()
     Local rX As Integer
-    Local rY As Integer
+    Local region As Integer
+    Local lineInRegion As Integer
+    Local y As Integer
+    Local startR As Integer
+    Local endR As Integer
     Local linesSinceCheck As Integer
+    Local linesDrawn As Integer
 
+    EnsureFramebuffer
+    FBWriteOn     ' draw Mandelbrot rows into FB#1
+
+    ' Precompute steps
     If MANDEL_W > 1 Then
         dx = (xMax - xMin) / (MANDEL_W - 1)
     Else
@@ -215,39 +286,71 @@ Sub RenderViewport()
     Else
         dy = 0
     EndIf
-    currDX = dx
-    currDY = dy
+    currDX = dx : currDY = dy
 
-    delta% = Fix28(dx)
-    If delta% = 0 Then delta% = 1
+    delta%   = Fix28(dx) : If delta% = 0 Then delta% = 1
+    dyFix%   = Fix28(dy)
+    xMinFix% = Fix28(xMin)
+    yMinFix% = Fix28(yMax) ' not used; keep for symmetry
+    yMinFix% = Fix28(yMin) ' effective value
 
     linesSinceCheck = 0
-    For rY = 0 To MANDEL_H - 1
-        startY% = Fix28(yMin + dy * rY)
+    linesDrawn = 0
 
-        ' Every ~10 lines, see if user pressed a key; if so, stash it and exit.
-        linesSinceCheck = linesSinceCheck + 1
-        If linesSinceCheck >= 10 Then
-            pendingKey% = ConsumeKeyIfAny()
-            If pendingKey% <> -1 Then Exit Sub
-            linesSinceCheck = 0
-        EndIf
+    ' Maximum number of lines any region can have
+    Local maxLines As Integer
+    maxLines = ((BLINDS - 1) * MANDEL_H) \ BLINDS   ' floor((BLINDS-1)/BLINDS * H)
+    If ((MANDEL_H) Mod BLINDS) <> 0 Then
+        maxLines = ((MANDEL_H + BLINDS - 1) \ BLINDS) ' ceil(H/BLINDS)
+    EndIf
 
-        For rX = 0 To MANDEL_W - 1 Step BLOCK_W
-            bCount% = MANDEL_W - rX
-            If bCount% > BLOCK_W Then bCount% = BLOCK_W
-            startX% = Fix28(xMin + dx * rX)
-            mandelbrot block%(0), startX%, startY%, delta%, bCount%, MAX_ITER
-            For i% = 0 To bCount% - 1
-                iter% = block%(i%)
-                If iter% > MAX_ITER Then iter% = MAX_ITER
-                g = Int(255 * iter% / MAX_ITER)
-                Pixel rX + i%, rY + MANDEL_TOP, colors%(g)
-            Next i%
-        Next rX
-    Next rY
+    For lineInRegion = 0 To maxLines - 1
+        For region = 0 To BLINDS - 1
+            ' Compute this region's start/end lines
+            startR = (region * MANDEL_H) \ BLINDS
+            endR   = ((region + 1) * MANDEL_H) \ BLINDS - 1
+            y = startR + lineInRegion
+            If y > endR Then
+                ' this region has no line at this index; skip
+            Else
+                ' Interrupt check about every 10 lines drawn
+                linesSinceCheck = linesSinceCheck + 1
+                If linesSinceCheck >= 10 Then
+                    pendingKey% = ConsumeKeyIfAny()
+                    If pendingKey% <> -1 Then
+                        FBWriteOff
+                        Exit Sub
+                    EndIf
+                    linesSinceCheck = 0
+                EndIf
+
+                ' Render scanline y into the framebuffer
+                startY% = Fix28(yMin + dy * y)   ' or yMinFix% + dyFix% * y
+                ' Using the integer form avoids float work per line:
+                startY% = yMinFix% + dyFix% * y
+
+                For rX = 0 To MANDEL_W - 1 Step BLOCK_W
+                    bCount% = MANDEL_W - rX : If bCount% > BLOCK_W Then bCount% = BLOCK_W
+                    startX% = xMinFix% + delta% * rX
+                    mandelbrot block%(0), startX%, startY%, delta%, bCount%, MAX_ITER
+                    For i% = 0 To bCount% - 1
+                        iter% = block%(i%) : If iter% > MAX_ITER Then iter% = MAX_ITER
+                        Pixel rX + i%, y, iterColor%(iter%)   ' draw into FB row y (off-screen)
+                    Next i%
+                Next rX
+
+                ' Push this completed scanline to the visible screen at MANDEL_TOP + y
+                FBWriteOff
+                BLIT FRAMEBUFFER F, N, 0, y, 0, MANDEL_TOP + y, MANDEL_W, 1
+                FBWriteOn
+
+                linesDrawn = linesDrawn + 1
+            EndIf
+        Next region
+    Next lineInRegion
+
+    FBWriteOff
 End Sub
-
 Sub DoZoom()
     Local boxSize As Integer
     Local moveStep As Integer
@@ -310,24 +413,96 @@ Sub DoZoom()
                 done = 1
         End Select
     Loop
+    CLS
     DrawMenu
     RenderViewport
 End Sub
 
-For g = 0 To 255
-    If g <= 63 Then
-        rc% = 0 : gc% = g * 4 : bc% = 255
-    ElseIf g <= 127 Then
-        rc% = 0 : gc% = 255 : bc% = 255 - 4 * (g - 64)
-    ElseIf g <= 191 Then
-        rc% = 4 * (g - 128) : gc% = 255 : bc% = 0
+
+
+Sub BuildPaletteFromStops(name$)
+  ' fixed-size stop arrays (8 stops)
+  Local sT(7) As Float
+  Local sR%(7), sG%(7), sB%(7)
+  Local i%, j% 
+  Local t As Float, segT As Float
+  Local r As Float, g As Float, b As Float
+  Local tt As Float
+  ' ---- define color stops ----
+  Select Case LCase$(name$)
+    Case "viridis"
+      sT(0)=0.00: sR%(0)= 68: sG%(0)=  1: sB%(0)= 84
+      sT(1)=0.15: sR%(1)= 71: sG%(1)= 44: sB%(1)=122
+      sT(2)=0.30: sR%(2)= 59: sG%(2)= 81: sB%(2)=138
+      sT(3)=0.45: sR%(3)= 44: sG%(3)=113: sB%(3)=142
+      sT(4)=0.60: sR%(4)= 33: sG%(4)=144: sB%(4)=141
+      sT(5)=0.75: sR%(5)= 73: sG%(5)=176: sB%(5)=110
+      sT(6)=0.90: sR%(6)=159: sG%(6)=190: sB%(6)= 87
+      sT(7)=1.00: sR%(7)=253: sG%(7)=231: sB%(7)= 37
+    Case "inferno"
+      sT(0)=0.00: sR%(0)=  0: sG%(0)=  0: sB%(0)=  4
+      sT(1)=0.15: sR%(1)= 31: sG%(1)= 12: sB%(1)= 72
+      sT(2)=0.30: sR%(2)= 85: sG%(2)= 15: sB%(2)=109
+      sT(3)=0.45: sR%(3)=136: sG%(3)= 34: sB%(3)=106
+      sT(4)=0.60: sR%(4)=191: sG%(4)= 72: sB%(4)= 83
+      sT(5)=0.75: sR%(5)=234: sG%(5)=132: sB%(5)= 52
+      sT(6)=0.90: sR%(6)=252: sG%(6)=194: sB%(6)= 68
+      sT(7)=1.00: sR%(7)=252: sG%(7)=255: sB%(7)=164
+    Case Else ' "turbo"
+      sT(0)=0.00: sR%(0)= 48: sG%(0)= 18: sB%(0)= 59
+      sT(1)=0.15: sR%(1)=  0: sG%(1)= 67: sB%(1)=166
+      sT(2)=0.30: sR%(2)=  3: sG%(2)=141: sB%(2)=195
+      sT(3)=0.45: sR%(3)= 46: sG%(3)=194: sB%(3)=126
+      sT(4)=0.60: sR%(4)=193: sG%(4)=221: sB%(4)= 61
+      sT(5)=0.75: sR%(5)=255: sG%(5)=170: sB%(5)=  0
+      sT(6)=0.90: sR%(6)=231: sG%(6)= 77: sB%(6)=  0
+      sT(7)=1.00: sR%(7)=125: sG%(7)=  0: sB%(7)=  0
+  End Select
+
+ ' ---- full-range iter->colour using non-linear spread ----
+  Local cycle%(CYCLE_COLORS - 1)
+  Local k%
+  Local idx%, src%
+
+  ' Build a 64-swatch cycle from the same palette stops
+  For k% = 0 To CYCLE_COLORS - 1
+    ' sample evenly across 0..1 (centered in each bin to avoid duplicate endpoints)
+    tt = (k% + 0.5) / CYCLE_COLORS
+    ' find segment for tt
+    For j% = 0 To 6
+      If tt <= sT(j%+1) Then Exit For
+    Next j%
+    If sT(j%+1) > sT(j%) Then
+      segT = (tt - sT(j%)) / (sT(j%+1) - sT(j%))
     Else
-        rc% = 255 : gc% = 255 - 4 * (g - 192) : bc% = 4 * (g - 192)
+      segT = 0
     EndIf
-    colors%(g) = RGB(rc%, gc%, bc%)
-Next g
+    r = sR%(j%) + (sR%(j%+1) - sR%(j%)) * segT
+    g = sG%(j%) + (sG%(j%+1) - sG%(j%)) * segT
+    b = sB%(j%) + (sB%(j%+1) - sB%(j%)) * segT
+    cycle%(k%) = RGB(Int(r), Int(g), Int(b))
+  Next k%
+
+  ' Map iterations cyclically:
+  ' 1..64  -> cycle 0..63
+  ' 65..128-> cycle 0..63, etc.
+  For i% = 0 To MAX_ITER - 1
+    If i% <= 0 Then
+      idx% = 0
+    Else
+      idx% = (i% - 1) Mod CYCLE_COLORS
+    EndIf
+    iterColor%(i%) = cycle%(idx%)
+  Next i%
+
+  ' Distinct interior (did not escape by MAX_ITER)
+  iterColor%(MAX_ITER) = RGB(0,0,0)
+
+End Sub
+
 
 CLS
+BuildPaletteFromStops PALETTE_NAME$
 ResetViewport
 DrawMenu
 RenderViewport
@@ -343,19 +518,36 @@ Do While running = 1
     EndIf
 
     Select Case keyCode
-        Case 90, 122          ' Z/z
+        Case 90, 122, 128, 129, 130, 131         ' Z/z, and arrows
             DoZoom
         Case 79, 111          ' O/o (zoom out/back)
             If PopViewport() Then
+                CLS
                 DrawMenu
                 RenderViewport
             EndIf
         Case 82, 114          ' R/r
             ResetViewport
+            CLS
             DrawMenu
             RenderViewport
         Case 27               ' Esc
             running = 0
+        Case 80, 112          ' P/p Palette cycle (debug)
+            ' cycle through palettes for testing
+            If LCase$(PALETTE_NAME$) = "turbo" Then
+                BuildPaletteFromStops "viridis"
+                PALETTE_NAME$ = "viridis"
+            ElseIf LCase$(PALETTE_NAME$) = "viridis" Then
+                BuildPaletteFromStops "inferno"
+                PALETTE_NAME$ = "inferno"
+            Else
+                BuildPaletteFromStops "turbo"
+                PALETTE_NAME$ = "turbo"
+            EndIf
+            CLS
+            DrawMenu
+            RenderViewport
     End Select
 Loop
 
